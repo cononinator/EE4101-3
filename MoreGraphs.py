@@ -1,4 +1,3 @@
-
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import KFold
@@ -10,8 +9,10 @@ from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 import seaborn as sns
 from ucimlrepo import fetch_ucirepo
-from itertools import product, count
+from itertools import product
 from collections import defaultdict
+import time
+
 
 # Fetch dataset
 concrete_compressive_strength = fetch_ucirepo(id=165)
@@ -51,13 +52,122 @@ class MLP(nn.Module):
         return self.layers(x)
 
 
-def train_model(model, train_loader, criterion, optimizer, epochs, device, verbose=False):
+class EarlyStopping:
+    def __init__(self, patience=30, min_delta=0.05, patience_plateau=15,
+                 plateau_window=10, max_oscillations=5, oscillation_threshold=0.02):
+        """
+        Args:
+            patience (int): How many epochs to wait after validation loss increase before stopping
+            min_delta (float): Minimum absolute change in validation loss to qualify as an improvement
+            patience_plateau (int): How many epochs to wait when training plateaus
+            plateau_window (int): Number of epochs to look back for plateau detection
+            max_oscillations (int): Maximum number of oscillations before considering plateau
+            oscillation_threshold (float): Threshold for considering a change as an oscillation
+        """
+        self.patience = patience
+        self.min_delta = min_delta
+        self.patience_plateau = patience_plateau
+        self.plateau_window = plateau_window
+        self.max_oscillations = max_oscillations
+        self.oscillation_threshold = oscillation_threshold
+
+        self.counter = 0
+        self.plateau_counter = 0
+        self.best_loss = None
+        self.loss_history = []
+        self.early_stop = False
+        self.best_model = None
+        self.stop_reason = None
+
+    def count_oscillations(self):
+        """Count the number of oscillations in the recent loss history."""
+        if len(self.loss_history) < 3:
+            return 0
+
+        # Get differences between consecutive losses
+        diffs = np.diff(self.loss_history[-self.plateau_window:])
+
+        # Count sign changes that are significant (beyond threshold)
+        oscillations = 0
+        for i in range(len(diffs) - 1):
+            if (abs(diffs[i]) > self.oscillation_threshold and
+                    abs(diffs[i + 1]) > self.oscillation_threshold and
+                    diffs[i] * diffs[i + 1] < 0):  # Sign change
+                oscillations += 1
+
+        return oscillations
+
+    def check_plateau(self):
+        """Check if the loss has plateaued by analyzing oscillations and trend."""
+        if len(self.loss_history) < self.plateau_window:
+            return False
+
+        recent_losses = np.array(self.loss_history[-self.plateau_window:])
+
+        # Check for oscillations
+        num_oscillations = self.count_oscillations()
+
+        # Check for overall improvement
+        start_loss = np.mean(recent_losses[:3])  # Average first 3 in window
+        end_loss = np.mean(recent_losses[-3:])  # Average last 3 in window
+        relative_improvement = abs((start_loss - end_loss) / start_loss) if start_loss != 0 else 0
+
+        # Calculate statistics to check for stable oscillation
+        loss_std = np.std(recent_losses)
+        loss_mean = np.mean(recent_losses)
+        coefficient_of_variation = loss_std / loss_mean if loss_mean != 0 else 0
+
+        # Consider it a plateau if we see:
+        # 1. Many oscillations with small overall improvement, or
+        # 2. Small variation around mean with enough samples
+        return ((num_oscillations >= self.max_oscillations and relative_improvement < self.oscillation_threshold) or
+                (coefficient_of_variation < self.oscillation_threshold and len(recent_losses) >= self.plateau_window))
+
+    def __call__(self, val_loss, train_loss, model):
+        self.loss_history.append(val_loss)
+
+        if self.best_loss is None:
+            self.best_loss = val_loss
+            self.save_model(model)
+            return False
+
+        # More permissive overfitting check
+        if val_loss > (self.best_loss + self.min_delta):
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+                self.stop_reason = "overfitting"
+                return True
+        else:
+            self.counter = 0
+            if val_loss < self.best_loss:
+                self.best_loss = val_loss
+                self.save_model(model)
+
+        # Check for plateau
+        if self.check_plateau():
+            self.plateau_counter += 1
+            if self.plateau_counter >= self.patience_plateau:
+                self.early_stop = True
+                self.stop_reason = "plateau"
+                return True
+        else:
+            self.plateau_counter = 0
+
+        return False
+
+    def save_model(self, model):
+        self.best_model = model.state_dict().copy()
+
+def train_model(model, train_loader, val_loader, criterion, optimizer, device, max_epochs=1000, verbose=False):
     train_losses = []
+    val_losses = []
+    early_stopping = EarlyStopping()
 
-    for epoch in range(epochs):
+    for epoch in range(max_epochs):
+        # Training phase
         model.train()
-        epoch_loss = 0
-
+        train_loss = 0
         for X_batch, y_batch in train_loader:
             X_batch, y_batch = X_batch.to(device), y_batch.to(device)
 
@@ -67,15 +177,35 @@ def train_model(model, train_loader, criterion, optimizer, epochs, device, verbo
             loss.backward()
             optimizer.step()
 
-            epoch_loss += loss.item()
+            train_loss += loss.item()
 
-        avg_loss = epoch_loss / len(train_loader)
-        train_losses.append(avg_loss)
+        avg_train_loss = train_loss / len(train_loader)
+        train_losses.append(avg_train_loss)
+
+        # Validation phase
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for X_batch, y_batch in val_loader:
+                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+                outputs = model(X_batch)
+                loss = criterion(outputs, y_batch)
+                val_loss += loss.item()
+
+        avg_val_loss = val_loss / len(val_loader)
+        val_losses.append(avg_val_loss)
+
+        if early_stopping(avg_val_loss, avg_train_loss, model):
+            if verbose:
+                print(f"\nEarly stopping triggered after {epoch + 1} epochs due to {early_stopping.stop_reason}")
+            model.load_state_dict(early_stopping.best_model)
+            return train_losses, val_losses, epoch + 1, early_stopping.stop_reason
 
         if verbose and (epoch + 1) % 20 == 0:
-            print(f'Epoch [{epoch + 1}/{epochs}], Loss: {avg_loss:.4f}')
+            print(f'\rEpoch [{epoch + 1}/{max_epochs}], Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}',
+                  end='')
 
-    return train_losses
+    return train_losses, val_losses, max_epochs, "max_epochs_reached"
 
 
 def evaluate_model(model, test_loader, device):
@@ -104,6 +234,43 @@ def evaluate_model(model, test_loader, device):
     return predictions, actuals, metrics
 
 
+def plot_training_curves(results, model_name):
+    plt.figure(figsize=(12, 6))
+    plt.plot(results['train_losses'], label='Training Loss')
+    plt.plot(results['val_losses'], label='Validation Loss')
+    plt.title(
+        f'Training Curves - {model_name}\nStopped after {results["epochs_run"]} epochs ({results["stop_reason"]})')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+
+def plot_metrics_comparison(final_results):
+    metrics = ['mse', 'rmse', 'mae', 'mape', 'r2']
+    n_metrics = len(metrics)
+    fig, axes = plt.subplots(1, n_metrics, figsize=(20, 6))
+
+    for i, metric in enumerate(metrics):
+        data = [(model, results[metric]['mean'], results[metric]['std'])
+                for model, results in final_results.items()]
+        models, means, stds = zip(*sorted(data, key=lambda x: x[1]))
+
+        axes[i].barh(range(len(models)), means, xerr=stds, height=0.8)
+        axes[i].set_yticks(range(len(models)))
+        axes[i].set_yticklabels([m.split('_', 1)[1] for m in models], fontsize=8)
+        axes[i].set_title(f'{metric.upper()}')
+        axes[i].grid(True)
+
+        # Rotate long labels
+        if i == 0:  # Only for the first subplot
+            axes[i].tick_params(axis='y', labelrotation=0)
+
+    plt.tight_layout()
+    plt.show()
+
+
 # Define architectures and activation functions
 architectures = [
     [64, 32],
@@ -124,20 +291,23 @@ activation_fns = {
 n_splits = 5
 kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-epochs = 100
 
 # Dictionary to store results
 cv_results = defaultdict(lambda: defaultdict(list))
+training_histories = defaultdict(list)
 all_predictions = defaultdict(list)
 
 # Perform cross-validation
 for fold, (train_idx, val_idx) in enumerate(kf.split(X)):
     print(f"\nFold {fold + 1}/{n_splits}")
+    print("-" * 80)
+    startTime = time.time()
 
-    # Split and scale data
+    # Split data
     X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
     y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
 
+    # Scale data
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_val_scaled = scaler.transform(X_val)
@@ -148,27 +318,37 @@ for fold, (train_idx, val_idx) in enumerate(kf.split(X)):
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=32)
 
-    count = 0
-
     for arch, (act_name, act_fn) in product(architectures, activation_fns.items()):
         model_name = f"MLP_{act_name}_{'_'.join(map(str, arch))}"
-        print(f"\rCount: {count} Training: {model_name}", end="", flush=True)
+        print(f"\nTraining {model_name}")
 
         model = MLP(X_train.shape[1], arch, act_fn).to(device)
         criterion = nn.MSELoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
-        # Train and evaluate
-        train_losses = train_model(model, train_loader, criterion, optimizer, epochs, device)
+        # Train with early stopping
+        train_losses, val_losses, epochs_run, stop_reason = train_model(
+            model, train_loader, val_loader, criterion, optimizer, device, verbose=True
+        )
+
+        # Evaluate
         predictions, actuals, metrics = evaluate_model(model, val_loader, device)
 
         # Store results
         for metric_name, value in metrics.items():
             cv_results[model_name][metric_name].append(value)
-        all_predictions[model_name].extend(list(zip(actuals, predictions)))
-        count += 1
 
-# Calculate mean and std of metrics across folds
+        training_histories[model_name].append({
+            'train_losses': train_losses,
+            'val_losses': val_losses,
+            'epochs_run': epochs_run,
+            'stop_reason': stop_reason
+        })
+
+        all_predictions[model_name].extend(list(zip(actuals, predictions)))
+    print(f"Fold {fold + 1} time taken: {time.time() - startTime}")
+
+# Calculate final results
 final_results = {}
 for model_name in cv_results:
     final_results[model_name] = {
@@ -179,80 +359,32 @@ for model_name in cv_results:
         for metric, values in cv_results[model_name].items()
     }
 
-
-# Plotting functions
-def plot_metrics_comparison(final_results):
-    metrics = ['mse', 'rmse', 'mae', 'mape', 'r2']
-    n_metrics = len(metrics)
-    fig, axes = plt.subplots(n_metrics, 1, figsize=(15, 5 * n_metrics))
-
-    for i, metric in enumerate(metrics):
-        means = [final_results[model][metric]['mean'] for model in final_results]
-        stds = [final_results[model][metric]['std'] for model in final_results]
-
-        axes[i].barh(range(len(final_results)), means, xerr=stds)
-        axes[i].set_yticks(range(len(final_results)))
-        axes[i].set_yticklabels(final_results.keys(), fontsize=8)
-        axes[i].set_title(f'{metric.upper()} Comparison')
-        axes[i].grid(True)
-
-    plt.tight_layout()
-    plt.show()
-
-
-def plot_prediction_scatter(all_predictions):
-    n_models = len(all_predictions)
-    cols = 3
-    rows = (n_models + cols - 1) // cols
-    fig, axes = plt.subplots(rows, cols, figsize=(15, 5 * rows))
-    axes = axes.flatten()
-
-    for i, (model_name, predictions) in enumerate(all_predictions.items()):
-        actuals, preds = zip(*predictions)
-        axes[i].scatter(actuals, preds, alpha=0.5)
-        axes[i].plot([min(actuals), max(actuals)], [min(actuals), max(actuals)], 'r--')
-        axes[i].set_title(f'{model_name}\nR² = {final_results[model_name]["r2"]["mean"]:.3f}')
-        axes[i].set_xlabel('Actual Values')
-        axes[i].set_ylabel('Predicted Values')
-        axes[i].grid(True)
-
-    for i in range(len(all_predictions), len(axes)):
-        fig.delaxes(axes[i])
-
-    plt.tight_layout()
-    plt.show()
-
-
-def plot_error_distribution(all_predictions):
-    n_models = len(all_predictions)
-    cols = 3
-    rows = (n_models + cols - 1) // cols
-    fig, axes = plt.subplots(rows, cols, figsize=(15, 5 * rows))
-    axes = axes.flatten()
-
-    for i, (model_name, predictions) in enumerate(all_predictions.items()):
-        actuals, preds = zip(*predictions)
-        errors = np.array(preds) - np.array(actuals)
-        sns.histplot(errors, kde=True, ax=axes[i])
-        axes[i].set_title(f'{model_name}\nError Distribution')
-        axes[i].set_xlabel('Prediction Error')
-
-    for i in range(len(all_predictions), len(axes)):
-        fig.delaxes(axes[i])
-
-    plt.tight_layout()
-    plt.show()
-
-
 # Print detailed results
 print("\nDetailed Cross-Validation Results:")
 print("-" * 80)
 for model_name, metrics in final_results.items():
     print(f"\n{model_name}:")
+    avg_epochs = np.mean([h['epochs_run'] for h in training_histories[model_name]])
+    stop_reasons = [h['stop_reason'] for h in training_histories[model_name]]
+    print(f"Average epochs: {avg_epochs:.1f}")
+    print(f"Stop reasons: {dict(pd.Series(stop_reasons).value_counts())}")
     for metric, values in metrics.items():
         print(f"{metric.upper()}: {values['mean']:.4f} ± {values['std']:.4f}")
 
 # Generate plots
 plot_metrics_comparison(final_results)
-plot_prediction_scatter(all_predictions)
-plot_error_distribution(all_predictions)
+
+# Plot training curves for best model
+best_model = min(final_results.items(), key=lambda x: x[1]['mse']['mean'])[0]
+print(f"\nPlotting training curves for best model: {best_model}")
+for fold, history in enumerate(training_histories[best_model]):
+    plt.figure(figsize=(10, 6))
+    plt.plot(history['train_losses'], label='Training Loss')
+    plt.plot(history['val_losses'], label='Validation Loss')
+    plt.title(
+        f'{best_model} - Fold {fold + 1}\nStopped after {history["epochs_run"]} epochs ({history["stop_reason"]})')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
