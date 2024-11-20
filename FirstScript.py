@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import torch_directml
+from numpy.ma.core import indices
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import StandardScaler
@@ -9,10 +10,12 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
+import scienceplots
 from ucimlrepo import fetch_ucirepo
 import psutil
 import time
 
+plt.style.use(['science', 'ieee'])
 
 def print_gpu_utilization():
     # DirectML doesn't have direct GPU memory queries, so we'll monitor CPU memory transfer
@@ -153,21 +156,26 @@ print(f"MSE: {mlp_mse:.2f}")
 print(f"R2 Score: {mlp_r2:.2f}")
 
 # Plotting results
-plt.figure(figsize=(12, 5))
+plt.figure()
 
 # Training and Test loss plot
-plt.subplot(1, 2, 1)
+# plt.subplot(1, 2, 1)
 plt.plot(train_losses, label='Train Loss')
 plt.plot(test_losses, label='Test Loss')
 plt.title('MLP Training and Test Loss')
 plt.xlabel('Epoch')
 plt.ylabel('MSE Loss')
 plt.legend()
+plt.show()
 
+plt.figure()
 # Prediction comparison plot
-plt.subplot(1, 2, 2)
+# plt.subplot(1, 2, 2)
+indices = np.random.choice(len(actuals), size=50, replace=False)
+sampled_actuals = actuals[indices]
+sampled_predictions = predictions[indices]
 plt.scatter(actuals, predictions, alpha=0.5, label='MLP')
-plt.plot([min(actuals), max(actuals)], [min(actuals), max(actuals)], 'r--')
+plt.plot([min(actuals), max(actuals)], [min(actuals), max(actuals)], 'r')
 plt.xlabel('Actual Values (GPa)')
 plt.ylabel('Predicted Values (GPa)')
 plt.title('Predictions vs Actuals')

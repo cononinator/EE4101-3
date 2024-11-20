@@ -242,7 +242,7 @@ for arch, (act_name, act_fn) in product(architectures, activation_fns.items()):
     }
 
 # Plotting results
-plt.figure(figsize=(20, 15))
+plt.figure()
 
 # Plot training and validation losses
 plt.subplot(2, 1, 1)

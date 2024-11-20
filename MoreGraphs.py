@@ -7,12 +7,14 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
+import scipy.io as sio
 import seaborn as sns
 from ucimlrepo import fetch_ucirepo
 from itertools import product
 from collections import defaultdict
 import time
 
+plt.style.use(['science', 'ieee'])
 
 # Fetch dataset
 concrete_compressive_strength = fetch_ucirepo(id=165)
